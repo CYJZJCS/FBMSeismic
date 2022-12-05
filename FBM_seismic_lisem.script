@@ -1,0 +1,152 @@
+void RunYuanjingModel(double ifa_mult, double coh_mult)
+{
+////DESCRIPTION////
+//this is the first version of coseismic modelling with FBM, but without calibration and validation
+
+// rho_r is the soil mineral density, kg m -3.
+    Map rho_r = density.map; 
+// rho_w is the water density, kg m -3.
+    double rho_w = 1000.0;
+// theta is the relative volumetric water content.
+    Map theta = gwh.map/soildepth.map;
+// g is gravitivity acceleration, m s-2.
+    double g = 9.8;
+// beta is slope angle.
+    Map beta = atan(slope.map);
+// a is the peak horizontal acceleration, gal.
+    Map a = pga.map;
+// hsd is the difference of elevation at surface and bedrock, m.
+    Map hsd = soildepth.map;
+// phi is soil porosity.
+    Map phi = theta.map;
+// coh is the soil cohesion, kg/(m s2).
+    Map coh = coh.map * 1000.0 * coh_mult; //coh converted from kpa to pascal
+// gamma is friction angle of tan, deg.
+    Map gamma = ifa.map * ifa_mult;
+    
+    
+    
+    double a0 = 2.05;
+    double a1 = 0.00439;
+    double a2 = -0.0118;
+    double a3 = 1.10;
+    Map clay = clay.map;
+    
+    
+    // fractal is fractal dimension of soil
+    Map fractal = a0 + (1 - 2.71828**(a1*clay)) / (a2 * (1 + 2.71828**(a1*clay)) + a3 * (1 - 2.71828**(a1*clay)));
+    // lambda is Brooks and Corey parameter of water retention curve, which is depended on the fractal demension.
+    Map lambda = 3-fractal; 
+    // tau_h is soil strength provided by capillary force, fomualtion chosen from Brooks and Corey model, kg/(m s2).
+    Map tau_h = rho_w * g * 0.042 * (lambda**-1.08) * ((theta - 0.01 * (lambda**-1.11)) / (phi - 0.01 * (lambda**-1.11)))**(1 - 1 / lambda);
+    // resisting is the resisting force along the slope.here, it is shear strenth based on infinite slope.
+    Map resisting = coh + (hsd * (theta * rho_w + (1 - phi) * rho_r) * g * (cos(beta))**2 - tau_h) * gamma - hsd * rho_r * (a / 100) * cos(beta) * sin(beta) * gamma;
+    
+    // use the Weibull parameter to represnt the resisting stress, which depend on the water content, soil charactersistic, and the number(10000) of the fibers that we defined, etc. so, the parameter should be modeled in advance. Here, I just set temporary values. 
+// m is scale parameter, linked to the distribution of thresholds: increasing m narrows the peak of distribution and decrase the amount of disorder.
+    Map m = fractal / (3 - fractal);
+    shape_m.map = m;
+
+
+    
+    
+   
+// driving is the driving force along the slope.
+    Map driving = hsd * ((theta * rho_w + (1 - phi) * rho_r) * g * cos(beta) * sin(beta) + rho_r * (a / 100) * (cos(beta))**2);
+   
+
+// exl is excess stress
+    Map exl = driving - resisting; 
+    
+    driving.map = driving;
+    resisting.map = resisting;
+    exl.map = exl;
+    tau_h.map = tau_h;
+    
+    
+    // base area
+    Map barea = 100.0/cos(beta);
+    
+
+
+
+    Map fraction_broken =exl * 0.0;
+
+    for(int r = 0; r < exl.Rows(); r++)
+    {
+          for(int c = 0; c < exl.Cols(); c++)
+          {
+          // if driving forece bigger than resisting force, means failure happens at base, 100% fibers are broken, so the percentage of broken fibers is 100%.
+                if(exl[r,c] > 0)
+                {
+                      fraction_broken[r,c] = 1;
+                // appiled the driving forece to the fibers. I assume that one column contains 10000 fiers. 
+                
+                }
+                else
+                {
+                //calculate k for this pixel, resistance multiplied by area divided by the number of fibers
+                double strength_fiber = resisting[r,c]*barea[r,c]/10000.0;
+                
+                double k = strength_fiber/(((1.0/m[r,c])**(1.0/m[r,c]) )*(2.71828**(-1.0/m[r,c])));
+                
+                      double bload = driving[r,c] * barea[r,c]; //load at base, kg m s-2.
+                      
+                      //TODO: calculate the load based on the number of intact fibers
+                      double bloadth = bload / 10000.0; //the load applied on single fibers at base, kg m s-2.
+                      double bfraction = 1 - 2.71828**(-1 / m[r,c]) - (m[r,c] * k * (1 / m[r,c])**(1 / m[r,c]))**(-0.5) * 2.71828**(-1 / (2 * m[r,c])) * (strength_fiber - bloadth)**0.5;
+                                fraction_broken[r,c] = bfraction;
+                      
+                          
+                            
+                
+                }
+          }
+    }
+    
+    bfraction.map = fraction_broken;
+   
+   
+   
+}
+
+
+
+//this function is the error function. It takes a list of parameters (2) and returns the model error 
+double Calibrate(array<double> params)
+{
+	//run the LISEM model, by calling a run file within the working directory.
+	//The second argument is a string containing the options is the following format: "name=value|name2=value2"
+	//the names can be found within the run-files. Add _cal_mult to a name to get the calibration multiplier.
+	//Here, we set the calibration multiplier for internal friction angle and cohesion.
+	
+	RunYuanjingModel(params[0],params[1]);
+
+
+
+
+	//load the impact and inventory maps
+	Map impact = LoadMap("bfraction.map") * error_calc_maskmv.map;
+	Map inventory = 1.0-LoadMap("inventory.tif") * error_calc_maskmv.map;
+	
+	//calculate error value through Cohens Kappa
+	double errorval = MapContinuousCohensKappa(inventory,impact,0.5);
+
+	//print info to output window
+	Print("Running model with ifa= " + ToString(params[0]) +"& coh= " + ToString(params[1]) + " score = " + ToString(1.0-errorval));
+
+	//actual error is 1.0- Cohens Kappa
+	return (1.0-errorval);
+}
+
+
+void main()
+{
+	//Optimize custom will minimize the error for a function
+	//the function Calibrate is defined above
+	//we start with two parameters of value 1.0 that must be positive.
+	//finite step size = 0.01, gradient step size  = 0.05
+	//gradient step size might need to be lowered for stable convergence.
+	OptimizeCustom({1.0,1.0},{true,true},@Calibrate,0.01,0.05);
+
+}
